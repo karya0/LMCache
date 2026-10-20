@@ -5,6 +5,7 @@
 from dataclasses import dataclass
 from itertools import islice
 from typing import Any, Generator, Sequence
+import os
 import threading
 import time
 
@@ -22,15 +23,14 @@ from lmcache.v1.distributed.api import (
     MemoryLayoutDesc,
     ObjectKey,
 )
+from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.gpu_connector.gpu_ops import (
     build_staging_copies,
-    lmcache_memcpy_async_d2h,
-    lmcache_memcpy_async_h2d,
 )
 from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.kv_layer_groups import ObjectGroupInfo
 from lmcache.v1.memory_allocators.lazy_memory_allocator import LazyMemoryAllocator
-from lmcache.v1.memory_management import GDSMemoryObject, MemoryObj
+from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.mp_observability.event import Event, EventType, next_transfer_key
 from lmcache.v1.mp_observability.event_bus import (
     get_event_bus,
@@ -57,6 +57,75 @@ from lmcache.v1.platform.cache_context import create_cache_context
 import lmcache.lmcache_native as lmcache_native
 
 logger = init_logger(__name__)
+
+# sealedkv: the GPU seals KV chunks in this module's staging buffer. Without the
+# plugin the module still imports, and gate 2 refuses every registration.
+try:
+    from sealedkv import keyprovider as sealedkv_keys
+    from sealedkv.serde import _key_repr as sealedkv_key_repr
+    import sealedkv.gpu_seal as sealedkv_gpu
+except ImportError as _e:
+    sealedkv_keys = sealedkv_gpu = sealedkv_key_repr = None
+    _SEALEDKV_IMPORT_ERROR = repr(_e)
+
+# Instances refused by gate 2, with the reason: their later traffic is named.
+_SEALEDKV_REFUSED: dict[int, str] = {}
+
+
+def _sealedkv_drain(cache_context: BaseCacheContext) -> None:
+    """Wait for every operation enqueued on the context stream before a failure
+    unwinds, so no DMA into a reservation or out of a read-locked object
+    outlives its lock. If the stream cannot be synchronized the buffers are in
+    an unknown state: the process exits rather than recycle them."""
+    try:
+        cache_context.cupy_stream.synchronize()
+    except BaseException:
+        logger.critical(
+            "sealedkv cannot drain the stream on %s after a failure; exiting",
+            cache_context.device,
+            exc_info=True,
+        )
+        os._exit(3)
+
+
+def _sealedkv_abort_writes(
+    l1_manager: Any, reserved: dict[ObjectKey, MemoryObj]
+) -> list[ObjectKey]:
+    """Release a failed store's reservations without a write-finished
+    notification (finish_write would notify the store controller and enqueue
+    L2 stores). Under the L1 manager's lock, each key that still maps to the
+    object this store reserved and is not read-locked is deleted as
+    L1Manager.delete does, its write lock released if still held (it may
+    have expired); anything else is left alone. Returns the deleted keys."""
+    deleted: list[ObjectKey] = []
+    freed: list[MemoryObj] = []
+    with l1_manager._lock:
+        for key, memory_obj in reserved.items():
+            state = l1_manager._objects.get(key)
+            if (
+                state is None
+                or state.memory_obj is not memory_obj
+                or state.read_lock.is_locked()
+            ):
+                continue
+            if state.write_lock.is_locked():
+                state.write_lock.unlock()
+            del l1_manager._objects[key]
+            deleted.append(key)
+            freed.append(memory_obj)
+        freed_meta = [l1_manager._object_meta(obj) for obj in freed]
+        l1_manager._memory_manager.free(freed)
+        for listener in l1_manager._registered_listeners:
+            listener.on_l1_keys_deleted_by_manager(deleted)
+        l1_manager._event_bus.publish(
+            Event(
+                event_type=EventType.L1_KEYS_EVICTED,
+                metadata={"keys": deleted, "meta": freed_meta},
+            )
+        )
+    return deleted
+
+
 _HAS_NATIVE_OBJECT_GROUP_TRANSFER: bool = hasattr(
     device_ops, "execute_object_group_transfer"
 )
@@ -481,6 +550,10 @@ def transfer_kv_per_object_group(
     direction: "lmcache_native.TransferDirection",
     *,
     transfer_key: str,
+    keys: Sequence[ObjectKey | None],
+    entry: "ContextEntry",
+    km: Any,
+    quarantine: Any,
 ) -> None:
     """Helper function to transfer memory objects of a single object group
     to/from GPU, with batching support.
@@ -503,6 +576,12 @@ def transfer_kv_per_object_group(
         direction: The transfer direction, H2D (retrieve) or D2H (store).
         transfer_key: Identity of this store/retrieve operation, echoed back on
             every phase-timing sample; see _run_object_group_transfer_plan.
+        keys: sealedkv: the ObjectKey of each entry of memory_objs (None where
+            the object is None or skipped).
+        entry, km, quarantine: sealedkv: the context's slots and GPU cipher,
+            the key material, and (H2D) the worker's quarantine. D2H seals
+            each chunk before its copy to host; H2D opens and verifies each
+            chunk before the scatter and raises on any failure.
 
     Raises:
         ValueError: If it founds None entry in memory_objs when direction is H2D.
@@ -510,20 +589,17 @@ def transfer_kv_per_object_group(
         This function expects the caller to stage the block ids (list[list[int]])
         into GPU tensors and pass them in as `block_ids_gpu`.
     """
-    if _HAS_NATIVE_OBJECT_GROUP_TRANSFER and not any(
-        isinstance(mo, GDSMemoryObject) for mo in memory_objs
-    ):
-        _run_object_group_transfer_plan(
-            cache_context,
-            block_ids_gpu,
-            memory_objs,
-            object_group_id,
-            batch_size,
-            skip_first_n_tokens,
-            direction,
-            transfer_key=transfer_key,
-        )
-        return
+    if _HAS_NATIVE_OBJECT_GROUP_TRANSFER:
+        raise RuntimeError("sealedkv: native transfer planner is not supported")
+    sealedkv_gpu.require_keys(memory_objs, keys)
+    if direction == lmcache_native.TransferDirection.H2D:
+        for obj_key in keys:
+            if obj_key is not None and obj_key in quarantine:
+                logger.error(
+                    "sealedkv GPU REJECTED %s: quarantined",
+                    sealedkv_key_repr(obj_key),
+                )
+                raise sealedkv_gpu.core.SealError("quarantined key")
 
     lmcache_chunk_size = cache_context.lmcache_tokens_per_chunk
     kv_groups_manager = cache_context.kv_layer_groups_manager
@@ -569,12 +645,28 @@ def transfer_kv_per_object_group(
         # For H2D, copy from CPU to GPU tmp buffers before the kernel launch
         if is_h2d:
             for chunk_idx, memory_obj in enumerate(memory_object_batch):
-                lmcache_memcpy_async_h2d(
-                    memory_obj,
-                    cache_context.get_temp_object_group_buffer(
-                        chunk_idx, object_group_id
-                    ),
+                tmp = cache_context.get_temp_object_group_buffer(
+                    chunk_idx, object_group_id
                 )
+                obj_key = keys[start_object_idx + chunk_idx]
+                try:
+                    sealedkv_gpu.open_chunk(
+                        entry, km, obj_key, chunk_idx, memory_obj, tmp
+                    )
+                except sealedkv_gpu.core.SealError as e:
+                    logger.error(
+                        "sealedkv GPU REJECTED %s: %s", sealedkv_key_repr(obj_key), e
+                    )
+                    if isinstance(e, sealedkv_gpu.Unauthentic):
+                        quarantine.add(obj_key)
+                    raise
+                except Exception as e:
+                    logger.error(
+                        "sealedkv GPU open FAILED %s: %r",
+                        sealedkv_key_repr(obj_key),
+                        e,
+                    )
+                    raise
 
         # Do paged KV copy
         for kernel_group_id in kernel_group_ids:
@@ -635,12 +727,21 @@ def transfer_kv_per_object_group(
         # For D2H, copy from GPU tmp buffers to CPU after the kernel launch
         if not is_h2d:
             for chunk_idx, memory_obj in enumerate(memory_object_batch):
-                lmcache_memcpy_async_d2h(
-                    cache_context.get_temp_object_group_buffer(
-                        chunk_idx, object_group_id
-                    ),
-                    memory_obj,
+                tmp = cache_context.get_temp_object_group_buffer(
+                    chunk_idx, object_group_id
                 )
+                obj_key = keys[start_object_idx + chunk_idx]
+                try:
+                    sealedkv_gpu.seal_chunk(
+                        entry, km, obj_key, chunk_idx, tmp, memory_obj
+                    )
+                except Exception as e:
+                    logger.error(
+                        "sealedkv GPU seal FAILED %s: %r",
+                        sealedkv_key_repr(obj_key),
+                        e,
+                    )
+                    raise
 
 
 @dataclass
@@ -665,6 +766,8 @@ class ContextEntry:
             PING. Selects the reap window (timeout vs registration grace).
             Latched only by PING, never by traffic.
         event_backend: Cached event backend selected for this context's device.
+        plain_layout, storage_layout, slots, gpu: sealedkv per-context state,
+            set by gate 2 (register_kv_cache).
     """
 
     cache_context: BaseCacheContext
@@ -673,6 +776,10 @@ class ContextEntry:
     last_seen: float = 0.0
     has_liveness_signal: bool = False
     event_backend: EventIPCBackend | None = None
+    plain_layout: MemoryLayoutDesc | None = None
+    storage_layout: MemoryLayoutDesc | None = None
+    slots: Any = None
+    gpu: Any = None
 
 
 class LMCacheDrivenTransferModule(InstanceLivenessTarget):
@@ -694,6 +801,11 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         # ops -- never across context creation, layout-registry calls, or
         # empty_cache (leaf-lock invariant: no thread holds two locks).
         self._lock = threading.Lock()
+        # sealedkv: keys whose frames failed authentication, bypassed until
+        # restart (design 5.3).
+        self._sealedkv_quarantine = (
+            sealedkv_gpu.Quarantine() if sealedkv_gpu is not None else None
+        )
 
         # Route finish_write / finish_read_prefetched through a C++ host
         # callback so the driver thread doesn't acquire the GIL.
@@ -785,6 +897,22 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             # reservation here: the remaining TP workers and concurrent
             # requests still own their independent read locks.
             self._ctx.storage_manager.finish_read_prefetched(obj_keys, read_locks=1)
+
+    def _sealedkv_abort_store(self, reserved: dict[ObjectKey, MemoryObj]) -> None:
+        """_sealedkv_abort_writes for a failed store, after the drain; logs
+        rather than raises."""
+        try:
+            aborted = _sealedkv_abort_writes(
+                self._ctx.storage_manager._l1_manager, reserved
+            )
+            if len(aborted) != len(reserved):
+                logger.error(
+                    "sealedkv store abort released %d of %d reservations",
+                    len(aborted),
+                    len(reserved),
+                )
+        except Exception:
+            logger.exception("sealedkv store abort failed")
 
     def context_entries_snapshot(self) -> dict[int, ContextEntry]:
         """Return a shallow copy of the registry for iteration or status.
@@ -976,18 +1104,54 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         num_object_groups = kv_groups_manager.num_object_groups
         event_backend = get_event_ipc_backend(cache_context.device)
         event_backend.check_event_support(cache_context.device)
-        layout_desc = get_layout_desc(
-            cache_context, self._ctx.chunk_size, object_group_id=0
-        )
-        # One layout per object group, also in the single-group case: no
-        # None special-casing downstream (group 0 maps to the merged layout).
-        group_layout_descs = {
-            gid: get_layout_desc(
-                cache_context, self._ctx.chunk_size, object_group_id=gid
-            )
-            for gid in range(num_object_groups)
-        }
         attn_desc = kv_groups_manager.get_attn_desc()
+        # sealedkv gate 2: L1 objects hold sealed frames of the storage layout.
+        refusal = None
+        try:
+            if sealedkv_gpu is None:
+                raise RuntimeError(
+                    "sealedkv.gpu_seal is not importable: " + _SEALEDKV_IMPORT_ERROR
+                )
+            registry = self._ctx.layout_desc_registry
+            plain_layout = get_layout_desc(cache_context, self._ctx.chunk_size, 0)
+            layout_desc = sealedkv_gpu.gate2(
+                cache_context.device,
+                num_object_groups,
+                attn_desc,
+                plain_layout,
+                registry.find(model_name, world_size),
+                registry.find_group_layout_descs(model_name, world_size),
+            )
+            slots = sealedkv_gpu.SealSlots(
+                cache_context.device,
+                sealedkv_gpu.plain_bytes(plain_layout),
+                cache_context.max_batch_size,
+            )
+            gpu = sealedkv_gpu.AesGcmGpu(cache_context.device)
+        except Exception as e:
+            refusal = str(e) or repr(e)
+        if refusal is not None:
+            # A raise would leave REGISTER unanswered (the MQ only logs handler
+            # exceptions): the worker would time out as if no server ran.
+            logger.error(
+                "sealedkv gate 2 REFUSED registration of instance %d (%s): %s; "
+                "this instance will not be served: every store and retrieve "
+                "from it will be refused",
+                instance_id,
+                model_name,
+                refusal,
+            )
+            _SEALEDKV_REFUSED[instance_id] = refusal
+            # Unmap the imported KV cache as _release_entries does.
+            cache_context.close()
+            del cache_context, kv_groups_manager
+            torch_dev.empty_cache()
+            ipc_collect = getattr(torch_dev, "ipc_collect", None)
+            if ipc_collect is not None:
+                ipc_collect()
+            return
+        _SEALEDKV_REFUSED.pop(instance_id, None)
+        group_layout_descs = {0: layout_desc}
         self._ctx.layout_desc_registry.register(
             model_name,
             world_size,
@@ -1004,6 +1168,10 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 last_seen=now,
                 has_liveness_signal=False,
                 event_backend=event_backend,
+                plain_layout=plain_layout,
+                storage_layout=layout_desc,
+                slots=slots,
+                gpu=gpu,
             )
 
         logger.info(
@@ -1085,6 +1253,13 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 "Rejecting STORE for unregistered GPU instance ID %d",
                 instance_id,
             )
+            if instance_id in _SEALEDKV_REFUSED:
+                logger.warning(
+                    "sealedkv STORE refused for instance %d: gate 2 refused its "
+                    "registration: %s",
+                    instance_id,
+                    _SEALEDKV_REFUSED[instance_id],
+                )
             return b"", False
         cache_context = entry.cache_context
         model_name = entry.model_name
@@ -1097,6 +1272,17 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             key, list(range(num_object_groups))
         )
         num_chunks = len(obj_keys_per_obj_group[0])
+
+        # sealedkv: a worker without key material reserves nothing.
+        provider = sealedkv_keys.shared()
+        km = provider.key_material()
+        if km is None:
+            logger.error(
+                "sealedkv REFUSED seal %d keys: no key material: %s",
+                num_chunks,
+                provider.reason,
+            )
+            return b"", False
 
         # NOTE: different engine groups may have different block sizes, so
         # ``blocks_per_chunk[i]`` is the number of blocks in one chunk for
@@ -1204,13 +1390,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     keys_to_reserve = [
                         k for i, k in enumerate(obj_keys) if not skip_mask[i]
                     ]
-                    layout_desc = get_layout_desc(
-                        cache_context,
-                        self._ctx.chunk_size,
-                        object_group_id=obj_group_id,
-                    )
                     reserved_dict = self._ctx.storage_manager.reserve_write(
-                        keys_to_reserve, layout_desc, "new"
+                        keys_to_reserve, entry.storage_layout, "new"
                     )
                     all_dict.update(reserved_dict)
                     if reserved_dict:
@@ -1235,23 +1416,43 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         skip_first_n_tokens=0,
                         direction=lmcache_native.TransferDirection.D2H,
                         transfer_key=transfer_key,
+                        keys=obj_keys,
+                        entry=entry,
+                        km=km,
+                        quarantine=self._sealedkv_quarantine,
                     )
 
+                # sealedkv: success is the synchronize, not a returned launch.
+                cache_context.cupy_stream.synchronize()
                 store_succeeded = True
-            except Exception:
-                logger.exception("Cannot store keys due to exception")
+            except BaseException as e:
+                if isinstance(e, Exception):
+                    logger.exception("Cannot store keys due to exception")
+                _sealedkv_drain(cache_context)
+                self._sealedkv_abort_store(all_dict)
+                if not isinstance(e, Exception):
+                    raise
             finally:
-                event_backend.record_event(event, cache_context.stream)
                 # Fail closed: commit the reserved objects only when every chunk
                 # copied successfully; otherwise the whole store is skipped.
                 stored_count = len(all_dict) if store_succeeded else 0
-                if stored_count:
-                    submit_callback_to_stream(
-                        cache_context.cupy_stream,
-                        "finish_write",
-                        list(all_dict.keys()),
-                    )
-                else:
+                # sealedkv: a raising record_event or submission has not
+                # scheduled finish_write, so the reservations are aborted here.
+                try:
+                    event_backend.record_event(event, cache_context.stream)
+                    if stored_count:
+                        submit_callback_to_stream(
+                            cache_context.cupy_stream,
+                            "finish_write",
+                            list(all_dict.keys()),
+                        )
+                except Exception:
+                    logger.exception("sealedkv store finalization failed")
+                    _sealedkv_drain(cache_context)
+                    if stored_count:
+                        self._sealedkv_abort_store(all_dict)
+                    store_succeeded, stored_count = False, 0
+                if not stored_count:
                     total_bytes = 0
                 num_tokens = num_chunks * self._ctx.chunk_size if stored_count else 0
                 self._ctx.event_bus.publish_on_stream(
@@ -1326,6 +1527,13 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 "Rejecting RETRIEVE for unregistered GPU instance ID %d",
                 instance_id,
             )
+            if instance_id in _SEALEDKV_REFUSED:
+                logger.warning(
+                    "sealedkv RETRIEVE refused for instance %d: gate 2 refused its "
+                    "registration: %s",
+                    instance_id,
+                    _SEALEDKV_REFUSED[instance_id],
+                )
             try:
                 self._release_failed_retrieve_locks(key, instance_id)
             except Exception:
@@ -1349,6 +1557,21 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             key, list(range(num_object_groups))
         )
         num_chunks = len(obj_keys_per_obj_group[0])
+
+        # sealedkv: a worker without key material reads nothing.
+        provider = sealedkv_keys.shared()
+        km = provider.key_material()
+        if km is None:
+            logger.error(
+                "sealedkv REJECTED open %d keys: no key material: %s",
+                num_chunks,
+                provider.reason,
+            )
+            try:
+                self._release_failed_retrieve_locks(key, instance_id)
+            except Exception:
+                logger.exception("Failed to release RETRIEVE locks after denial")
+            return b"", False
 
         # CPU-synchronous sentinel: a GPU retrieve is about to be enqueued.
         # Must be published via publish() (not publish_on_stream) so the
@@ -1444,6 +1667,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             prefetched_keys: list[ObjectKey] = []
             total_bytes = 0
             retrieve_succeeded = True
+            unauthentic_keys: list[ObjectKey] = []
             try:
                 for obj_group_id in range(num_object_groups):
                     if obj_group_id in skipped_groups:
@@ -1467,31 +1691,61 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                             window_objs
                         )
 
-                        transfer_kv_per_object_group(
-                            cache_context,
-                            block_ids_per_group_gpu,
-                            memory_objs,
-                            object_group_id=obj_group_id,
-                            batch_size=cache_context.max_batch_size,
-                            skip_first_n_tokens=skip_first_n_tokens,
-                            direction=lmcache_native.TransferDirection.H2D,
-                            transfer_key=transfer_key,
-                        )
+                        # sealedkv: drain before the read locks are released.
+                        try:
+                            transfer_kv_per_object_group(
+                                cache_context,
+                                block_ids_per_group_gpu,
+                                memory_objs,
+                                object_group_id=obj_group_id,
+                                batch_size=cache_context.max_batch_size,
+                                skip_first_n_tokens=skip_first_n_tokens,
+                                direction=lmcache_native.TransferDirection.H2D,
+                                transfer_key=transfer_key,
+                                keys=[None] * skip + list(in_window_keys),
+                                entry=entry,
+                                km=km,
+                                quarantine=self._sealedkv_quarantine,
+                            )
+                        except BaseException:
+                            _sealedkv_drain(cache_context)
+                            raise
                         # Extend only after the copy is enqueued: on exception,
                         # read_prefetched_results releases this group's locks
                         # itself, and a key must not be released twice.
                         prefetched_keys.extend(in_window_keys)
-            except Exception:
+            except Exception as e:
                 logger.exception("Cannot retrieve keys due to exception")
                 retrieve_succeeded = False
+                if isinstance(e, sealedkv_gpu.Unauthentic):
+                    unauthentic_keys.append(e.key)
             finally:
-                event_backend.record_event(event, cache_context.stream)
-                if prefetched_keys:
-                    submit_callback_to_stream(
-                        cache_context.cupy_stream,
-                        "finish_read_prefetched",
-                        prefetched_keys,
-                    )
+                # sealedkv: until finish_read_prefetched is submitted this
+                # retrieve owns the read locks of prefetched_keys. A raising
+                # record_event or submission has not scheduled it: drain (the
+                # scatter may be pending) and release them here, once.
+                try:
+                    event_backend.record_event(event, cache_context.stream)
+                    if prefetched_keys:
+                        submit_callback_to_stream(
+                            cache_context.cupy_stream,
+                            "finish_read_prefetched",
+                            prefetched_keys,
+                        )
+                except Exception:
+                    logger.exception("sealedkv retrieve finalization failed")
+                    _sealedkv_drain(cache_context)
+                    retrieve_succeeded = False
+                    if prefetched_keys:
+                        try:
+                            self._ctx.storage_manager.finish_read_prefetched(
+                                prefetched_keys
+                            )
+                        except Exception:
+                            logger.exception(
+                                "sealedkv release of retrieve read locks failed"
+                            )
+                        prefetched_keys = []
                 num_tokens = (
                     num_chunks * self._ctx.chunk_size
                     if len(prefetched_keys) == expected_retained
@@ -1514,6 +1768,22 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         },
                     ),
                 )
+        # sealedkv: best-effort eviction of frames that failed authentication,
+        # now that this retrieve's read locks are released (design 5.3).
+        if unauthentic_keys:
+            try:
+                result = self._ctx.storage_manager._l1_manager.delete(
+                    unauthentic_keys
+                )
+                for k, err in result.items():
+                    if err != L1Error.SUCCESS:
+                        logger.warning(
+                            "sealedkv could not evict quarantined %s from L1: %s",
+                            sealedkv_key_repr(k),
+                            err.name,
+                        )
+            except Exception:
+                logger.exception("sealedkv eviction of quarantined keys failed")
         if retrieve_succeeded:
             tokens_retrieved = num_chunks * self._ctx.chunk_size
             ed = time.perf_counter()
